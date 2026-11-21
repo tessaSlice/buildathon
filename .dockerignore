@@ -1,0 +1,21 @@
+# The image only needs the Rust solution sources. Datasets stay out of the
+# build: the scorer mounts them at /data.
+**/target
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.zip
+dev-answer
+starter-duckdb
+starter-polars
+starter-pyspark
+solutions/duckdb
+solutions/polars
+solutions/pyspark
+solutions/rust/fixtures
+solutions/rust/scripts
+solutions/rust/target
+generator
+ARCHITECTURE.md
+**/*.parquet
+.git

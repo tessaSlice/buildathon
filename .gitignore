@@ -1,0 +1,9 @@
+# Keep the scored commit under 50 MB. The input data is mounted at run time.
+**/target/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+*.parquet
+/dev/
+/out/
+dev-answer/
