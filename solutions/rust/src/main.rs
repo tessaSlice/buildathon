@@ -8,7 +8,6 @@
 
 mod fast;
 mod parquet;
-mod probe;
 
 use std::collections::HashMap;
 use std::env;
@@ -483,10 +482,10 @@ struct Queue {
 }
 
 fn main() {
-    // Dev-set failure is the only run that returns stderr. This commit prints
-    // the machine and exits before any table. The following commit restores
-    // the engine. Select this commit on the contest site, not the revert.
-    probe::run();
+    if let Err(err) = dispatch() {
+        eprintln!("error: {err}");
+        std::process::exit(1);
+    }
 }
 
 fn dispatch() -> io::Result<()> {
