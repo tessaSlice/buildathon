@@ -5,4 +5,4 @@ set -eu
 export DATA_DIR OUTPUT_DIR SCRATCH_DIR
 # Read-only root filesystem: everything that wants a temp or home dir gets /scratch.
 export TMPDIR="$SCRATCH_DIR" HOME="$SCRATCH_DIR"
-exec python3 /app/pipeline/pipeline.py
+exec /app/shopping "$DATA_DIR" "$SCRATCH_DIR" "$OUTPUT_DIR"
