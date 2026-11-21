@@ -258,6 +258,8 @@ struct UserShard {
     slots: Vec<Slot>,
     arena: Vec<u8>,
     spans: Vec<(u32, u32)>,
+    /// Packed key for each span, or 0 when the name did not pack.
+    keys: Vec<u64>,
     used: usize,
 }
 
@@ -402,7 +404,36 @@ impl UserShard {
             slots: vec![Slot { key: 0, id: EMPTY }; slots],
             arena: Vec::new(),
             spans: Vec::new(),
+            keys: Vec::new(),
             used: 0,
+        }
+    }
+
+    fn push_user(&mut self, key: u64, bytes: &[u8]) -> u32 {
+        let id = self.spans.len() as u32;
+        let off = self.arena.len();
+        assert!(off <= u32::MAX as usize, "name arena exceeded 4 GiB");
+        self.arena.extend_from_slice(bytes);
+        self.spans.push((off as u32, bytes.len() as u32));
+        self.keys.push(key);
+        self.used += 1;
+        id
+    }
+
+    fn rebuild_slots(&mut self) {
+        let n = (self.used.max(1) * 2).next_power_of_two().max(16);
+        let mut hashes = Vec::with_capacity(self.keys.len());
+        for (id, &key) in self.keys.iter().enumerate() {
+            let hash = if key != 0 {
+                mix_key(key)
+            } else {
+                hash_bytes(self.name(id as u32))
+            };
+            hashes.push((hash, key, id as u32));
+        }
+        self.slots = vec![Slot { key: 0, id: EMPTY }; n];
+        for (hash, key, id) in hashes {
+            self.insert_slot(hash, key, id);
         }
     }
 
@@ -500,6 +531,7 @@ impl UserShard {
         assert!(off <= u32::MAX as usize, "name arena exceeded 4 GiB");
         self.arena.extend_from_slice(bytes);
         self.spans.push((off as u32, bytes.len() as u32));
+        self.keys.push(key);
         self.insert_slot(hash, key, id);
         self.used += 1;
         id
@@ -1211,32 +1243,51 @@ fn intern_all(
     nthreads: usize,
 ) -> (Names, Vec<Vec<Slim>>, Vec<Vec<Click>>) {
     let n = nthreads.max(1);
-    let mut ev_counts = vec![0usize; n];
+    let bins = n * USER_SUBS;
+    let mut ev_counts = vec![0usize; bins];
     for row in &events {
-        ev_counts[bucket(user_probe(row.user_hash, row.user_len), n)] += 1;
+        let p = user_probe(row.user_hash, row.user_len);
+        ev_counts[bucket(p, n) * USER_SUBS + ((p >> 56) as usize)] += 1;
     }
-    let mut cl_counts = vec![0usize; n];
+    let mut cl_counts = vec![0usize; bins];
     for row in &clicks {
-        cl_counts[bucket(user_probe(row.user_hash, row.user_len), n)] += 1;
+        let p = user_probe(row.user_hash, row.user_len);
+        cl_counts[bucket(p, n) * USER_SUBS + ((p >> 56) as usize)] += 1;
     }
-    let mut ev_buckets = Vec::with_capacity(n);
-    let mut cl_buckets = Vec::with_capacity(n);
-    for i in 0..n {
-        ev_buckets.push(Vec::with_capacity(ev_counts[i]));
-        cl_buckets.push(Vec::with_capacity(cl_counts[i]));
+    let mut ev_flat = Vec::with_capacity(bins);
+    let mut cl_flat = Vec::with_capacity(bins);
+    for i in 0..bins {
+        ev_flat.push(Vec::with_capacity(ev_counts[i]));
+        cl_flat.push(Vec::with_capacity(cl_counts[i]));
     }
     for row in events {
-        ev_buckets[bucket(user_probe(row.user_hash, row.user_len), n)].push(row);
+        let p = user_probe(row.user_hash, row.user_len);
+        ev_flat[bucket(p, n) * USER_SUBS + ((p >> 56) as usize)].push(row);
     }
     for row in clicks {
-        cl_buckets[bucket(user_probe(row.user_hash, row.user_len), n)].push(row);
+        let p = user_probe(row.user_hash, row.user_len);
+        cl_flat[bucket(p, n) * USER_SUBS + ((p >> 56) as usize)].push(row);
     }
+    let mut ev_by_shard = Vec::with_capacity(n);
+    let mut cl_by_shard = Vec::with_capacity(n);
+    for shard in 0..n {
+        let mut ev_parts = Vec::with_capacity(USER_SUBS);
+        let mut cl_parts = Vec::with_capacity(USER_SUBS);
+        for sub in 0..USER_SUBS {
+            ev_parts.push(std::mem::take(&mut ev_flat[shard * USER_SUBS + sub]));
+            cl_parts.push(std::mem::take(&mut cl_flat[shard * USER_SUBS + sub]));
+        }
+        ev_by_shard.push(ev_parts);
+        cl_by_shard.push(cl_parts);
+    }
+    drop(ev_flat);
+    drop(cl_flat);
 
     let built = std::thread::scope(|scope| {
         let mut guards = Vec::with_capacity(n);
         for i in 0..n {
-            let ev = ev_buckets.pop().unwrap();
-            let cl = cl_buckets.pop().unwrap();
+            let ev = ev_by_shard.pop().unwrap();
+            let cl = cl_by_shard.pop().unwrap();
             let idx = n - 1 - i;
             guards.push(scope.spawn(move || intern_bucket(idx, ev, cl, text, links, n)));
         }
@@ -1289,47 +1340,202 @@ fn intern_all(
     (Names { shards, prefix }, slims, click_out)
 }
 
+const USER_SUBS: usize = 256;
+
+/// Open-address map that lives in L2. One of these is reused per user sub-bucket,
+/// so a whale is a hot slot instead of a random probe into a 32 MiB table.
+struct GenMap {
+    slots: Vec<Slot>,
+    gen: Vec<u32>,
+    stamp: u32,
+    used: usize,
+}
+
+impl GenMap {
+    fn new(cap: usize) -> Self {
+        let n = cap.next_power_of_two().max(16);
+        Self {
+            slots: vec![Slot { key: 0, id: EMPTY }; n],
+            gen: vec![0; n],
+            stamp: 1,
+            used: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.stamp = self.stamp.wrapping_add(1);
+        if self.stamp == 0 {
+            self.gen.fill(0);
+            self.stamp = 1;
+        }
+        self.used = 0;
+    }
+
+    fn ensure(&mut self, map: &UserShard) {
+        if self.slots.is_empty() || (self.used + 1) * 10 >= self.slots.len() * 7 {
+            let n = (self.slots.len().max(1) * 2).next_power_of_two().max(1024);
+            self.rehash(n, map);
+        }
+    }
+
+    fn rehash(&mut self, n: usize, map: &UserShard) {
+        let old_slots = std::mem::replace(&mut self.slots, vec![Slot { key: 0, id: EMPTY }; n]);
+        let old_gen = std::mem::replace(&mut self.gen, vec![0; n]);
+        let stamp = self.stamp;
+        self.used = 0;
+        for i in 0..old_slots.len() {
+            if old_gen[i] == stamp {
+                let key = old_slots[i].key;
+                let id = old_slots[i].id;
+                let hash = if key != 0 {
+                    mix_key(key)
+                } else {
+                    hash_bytes(map.name(id))
+                };
+                self.insert_fresh(key, id, hash);
+            }
+        }
+    }
+
+    fn insert_fresh(&mut self, key: u64, id: u32, hash: u64) {
+        let mask = self.slots.len() - 1;
+        let mut i = (hash as usize) & mask;
+        loop {
+            if self.gen[i] != self.stamp {
+                self.gen[i] = self.stamp;
+                self.slots[i] = Slot { key, id };
+                self.used += 1;
+                return;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    fn find_key(&self, hash: u64, key: u64) -> Option<u32> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = (hash as usize) & mask;
+        for _ in 0..self.slots.len() {
+            if self.gen[i] != self.stamp {
+                return None;
+            }
+            if self.slots[i].key == key {
+                return Some(self.slots[i].id);
+            }
+            i = (i + 1) & mask;
+        }
+        None
+    }
+
+    fn find_bytes(&self, map: &UserShard, hash: u64, bytes: &[u8]) -> Option<u32> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = (hash as usize) & mask;
+        for _ in 0..self.slots.len() {
+            if self.gen[i] != self.stamp {
+                return None;
+            }
+            let slot = self.slots[i];
+            if slot.key == 0 && map.name(slot.id) == bytes {
+                return Some(slot.id);
+            }
+            i = (i + 1) & mask;
+        }
+        None
+    }
+
+    fn intern_packed(&mut self, map: &mut UserShard, key: u64) -> u32 {
+        let hash = mix_key(key);
+        if let Some(id) = self.find_key(hash, key) {
+            return id;
+        }
+        self.ensure(map);
+        let mut buf = [0u8; 9];
+        let n = unpack_id(key, &mut buf);
+        let id = map.push_user(key, &buf[..n]);
+        self.insert_fresh(key, id, hash);
+        id
+    }
+
+    fn intern_bytes(&mut self, map: &mut UserShard, hash: u64, bytes: &[u8]) -> u32 {
+        let key = pack_id(bytes);
+        if key != 0 {
+            return self.intern_packed(map, key);
+        }
+        if let Some(id) = self.find_bytes(map, hash, bytes) {
+            return id;
+        }
+        self.ensure(map);
+        let id = map.push_user(0, bytes);
+        self.insert_fresh(0, id, hash);
+        id
+    }
+}
+
 fn intern_bucket(
     idx: usize,
-    events: Vec<Compact>,
-    clicks: Vec<Clk>,
+    events: Vec<Vec<Compact>>,
+    clicks: Vec<Vec<Clk>>,
     text: &[u8],
     links: &[(Vec<u8>, Vec<u8>)],
     nthreads: usize,
 ) -> (UserShard, Vec<Slim>, Vec<Click>) {
-    let mut map = UserShard::with_capacity(events.len() / 8 + clicks.len() / 8 + 1024);
-    let mut slims = Vec::with_capacity(events.len());
-    for row in events {
-        let local = if row.user_len == 0 {
-            map.intern_packed(row.user_hash)
-        } else {
-            let bytes = &text[row.user_off as usize..row.user_off as usize + row.user_len as usize];
-            map.intern(row.user_hash, bytes)
-        };
-        slims.push(Slim {
-            ts: row.ts,
-            person: local,
-            cat: row.cat,
-            price: row.price,
-            purchase: row.purchase,
-        });
+    let mut n_ev = 0usize;
+    let mut n_cl = 0usize;
+    for part in &events {
+        n_ev += part.len();
     }
-    let mut out_clicks = Vec::with_capacity(clicks.len());
-    for row in clicks {
-        let local = if row.user_len == 0 {
-            map.intern_packed(row.user_hash)
-        } else {
-            let bytes = &text[row.user_off as usize..row.user_off as usize + row.user_len as usize];
-            map.intern(row.user_hash, bytes)
-        };
-        out_clicks.push(Click {
-            ts: row.ts,
-            person: local,
-            camp: row.camp,
-            id_off: row.id_off,
-            id_len: row.id_len,
-        });
+    for part in &clicks {
+        n_cl += part.len();
     }
+    let mut map = UserShard {
+        slots: Vec::new(),
+        arena: Vec::new(),
+        spans: Vec::new(),
+        keys: Vec::new(),
+        used: 0,
+    };
+    let mut small = GenMap::new(4096);
+    let mut slims = Vec::with_capacity(n_ev);
+    let mut out_clicks = Vec::with_capacity(n_cl);
+    for s in 0..USER_SUBS {
+        small.clear();
+        for row in &events[s] {
+            let local = if row.user_len == 0 {
+                small.intern_packed(&mut map, row.user_hash)
+            } else {
+                let bytes = &text[row.user_off as usize..row.user_off as usize + row.user_len as usize];
+                small.intern_bytes(&mut map, row.user_hash, bytes)
+            };
+            slims.push(Slim {
+                ts: row.ts,
+                person: local,
+                cat: row.cat,
+                price: row.price,
+                purchase: row.purchase,
+            });
+        }
+        for row in &clicks[s] {
+            let local = if row.user_len == 0 {
+                small.intern_packed(&mut map, row.user_hash)
+            } else {
+                let bytes = &text[row.user_off as usize..row.user_off as usize + row.user_len as usize];
+                small.intern_bytes(&mut map, row.user_hash, bytes)
+            };
+            out_clicks.push(Click {
+                ts: row.ts,
+                person: local,
+                camp: row.camp,
+                id_off: row.id_off,
+                id_len: row.id_len,
+            });
+        }
+    }
+    map.rebuild_slots();
     for (a, b) in links {
         let ka = pack_id(a);
         if ka != 0 {
