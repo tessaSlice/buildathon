@@ -650,11 +650,12 @@ fn accept_event(
     } else {
         lookup(product, b"p", prod_arr, products).unwrap_or(unknown)
     };
-    let id_hash = hash_bytes(id);
-    let user_hash = hash_bytes(user);
-    let id_off = push_raw(&mut out.arena, id);
+    // Short ASCII ids are the pack key itself. `len == 0` means that hash is
+    // the key, so dedup and intern never hash or copy those bytes. Ingest
+    // stays as raw text: the smallest ingest string wins, before validation.
+    let (id_hash, id_off, id_len) = stash_key(&mut out.arena, id);
     let ing_off = push_raw(&mut out.arena, ing_b);
-    let user_off = push_raw(&mut out.arena, user);
+    let (user_hash, user_off, user_len) = stash_key(&mut out.arena, user);
     let shard = bucket(id_hash, nshards);
     out.events[shard].push(EHit {
         id_hash,
@@ -663,9 +664,9 @@ fn accept_event(
         id_off,
         ing_off,
         user_off,
-        id_len: id.len() as u32,
+        id_len,
         ing_len: ing_b.len() as u32,
-        user_len: user.len() as u32,
+        user_len,
         cat,
         price,
         flags,
@@ -731,10 +732,8 @@ fn push_click(
     {
         flags |= OK;
     }
-    let id_hash = hash_bytes(id);
-    let user_hash = hash_bytes(user);
-    let id_off = push_raw(&mut out.arena, id);
-    let user_off = push_raw(&mut out.arena, user);
+    let (id_hash, id_off, id_len) = stash_key(&mut out.arena, id);
+    let (user_hash, user_off, user_len) = stash_key(&mut out.arena, user);
     let shard = bucket(id_hash, nshards);
     out.clicks[shard].push(CHit {
         id_hash,
@@ -742,11 +741,23 @@ fn push_click(
         ts: ts.unwrap_or(0),
         id_off,
         user_off,
-        id_len: id.len() as u32,
-        user_len: user.len() as u32,
+        id_len,
+        user_len,
         camp: camp.unwrap_or(0),
         flags,
     });
+}
+
+/// Pack 1..=9 ASCII bytes into the hash and skip the arena. Anything else is
+/// hashed and copied. A zero length is a packed key only when the hash is the
+/// key; empty input does not pack, so it is stored as a real (empty) copy.
+fn stash_key(arena: &mut Vec<u8>, bytes: &[u8]) -> (u64, u32, u32) {
+    let key = crate::pack_id(bytes);
+    if key != 0 {
+        (key, 0, 0)
+    } else {
+        (hash_bytes(bytes), push_raw(arena, bytes), bytes.len() as u32)
+    }
 }
 
 fn push_raw(arena: &mut Vec<u8>, bytes: &[u8]) -> u32 {
@@ -868,7 +879,9 @@ fn dedup_clicks(threads: &[ThreadOut], shard: usize, emit: &mut ShardEmit, count
 
 #[inline(always)]
 fn finger(hash: u64) -> usize {
-    ((hash >> 32) as usize) & FINGER_MASK
+    // Pack keys are not uniform in the high bits. Mix before the 26-bit
+    // counter so unique ids do not all fall into the same slots.
+    ((crate::mix_key(hash) >> 32) as usize) & FINGER_MASK
 }
 
 fn bump_event_counts(hits: &[EHit], count: &mut [u8]) {
@@ -937,7 +950,7 @@ fn resolve_events(threads: &[ThreadOut], shard: usize, suspects: &[Loc], emit: &
                 break;
             }
             if slots[i].hash == s.hash
-                && event_id(threads, shard, src, slots[i].row) == event_id(threads, shard, s.src, s.row)
+                && same_event_id(threads, shard, src, slots[i].row, s.src, s.row)
             {
                 // Smallest ingest wins. Equal ingest copies are identical.
                 if event_ing(threads, shard, s.src, s.row) < event_ing(threads, shard, src, slots[i].row)
@@ -979,8 +992,7 @@ fn resolve_clicks(threads: &[ThreadOut], shard: usize, suspects: &[Loc], emit: &
                 slots[i] = *s;
                 break;
             }
-            if slots[i].hash == s.hash
-                && click_id(threads, shard, src, slots[i].row) == click_id(threads, shard, s.src, s.row)
+            if slots[i].hash == s.hash && same_click_id(threads, shard, src, slots[i].row, s.src, s.row)
             {
                 break;
             }
@@ -1020,9 +1032,25 @@ fn slot_index(hash: u64, mask: usize) -> usize {
     (mixed as usize) & mask
 }
 
-fn event_id<'a>(threads: &'a [ThreadOut], shard: usize, src: u32, row: u32) -> &'a [u8] {
-    let hit = &threads[src as usize].events[shard][row as usize];
-    slice(&threads[src as usize].arena, hit.id_off, hit.id_len)
+fn same_event_id(
+    threads: &[ThreadOut],
+    shard: usize,
+    a_src: u32,
+    a_row: u32,
+    b_src: u32,
+    b_row: u32,
+) -> bool {
+    let a = &threads[a_src as usize].events[shard][a_row as usize];
+    let b = &threads[b_src as usize].events[shard][b_row as usize];
+    // Both packed: the hash is the id. A packed key never equals a copied id.
+    if a.id_len == 0 && b.id_len == 0 {
+        return a.id_hash == b.id_hash;
+    }
+    if a.id_len == 0 || b.id_len == 0 {
+        return false;
+    }
+    slice(&threads[a_src as usize].arena, a.id_off, a.id_len)
+        == slice(&threads[b_src as usize].arena, b.id_off, b.id_len)
 }
 
 fn event_ing<'a>(threads: &'a [ThreadOut], shard: usize, src: u32, row: u32) -> &'a [u8] {
@@ -1030,13 +1058,41 @@ fn event_ing<'a>(threads: &'a [ThreadOut], shard: usize, src: u32, row: u32) -> 
     slice(&threads[src as usize].arena, hit.ing_off, hit.ing_len)
 }
 
-fn click_id<'a>(threads: &'a [ThreadOut], shard: usize, src: u32, row: u32) -> &'a [u8] {
-    let hit = &threads[src as usize].clicks[shard][row as usize];
-    slice(&threads[src as usize].arena, hit.id_off, hit.id_len)
+fn same_click_id(
+    threads: &[ThreadOut],
+    shard: usize,
+    a_src: u32,
+    a_row: u32,
+    b_src: u32,
+    b_row: u32,
+) -> bool {
+    let a = &threads[a_src as usize].clicks[shard][a_row as usize];
+    let b = &threads[b_src as usize].clicks[shard][b_row as usize];
+    if a.id_len == 0 && b.id_len == 0 {
+        return a.id_hash == b.id_hash;
+    }
+    if a.id_len == 0 || b.id_len == 0 {
+        return false;
+    }
+    slice(&threads[a_src as usize].arena, a.id_off, a.id_len)
+        == slice(&threads[b_src as usize].arena, b.id_off, b.id_len)
 }
 
 fn emit_event_hit(thread: &ThreadOut, hit: &EHit, emit: &mut ShardEmit) {
     if hit.flags & OK == 0 {
+        return;
+    }
+    // user_len == 0 on a kept row is a packed user. Intern reads the key.
+    if hit.user_len == 0 {
+        emit.events.push(Compact {
+            user_hash: hit.user_hash,
+            ts: hit.ts,
+            user_off: 0,
+            user_len: 0,
+            cat: hit.cat,
+            price: hit.price,
+            purchase: hit.flags & BUY != 0,
+        });
         return;
     }
     let user = slice(&thread.arena, hit.user_off, hit.user_len);
@@ -1056,10 +1112,22 @@ fn emit_click_hit(thread: &ThreadOut, hit: &CHit, emit: &mut ShardEmit) {
     if hit.flags & OK == 0 {
         return;
     }
-    let user = slice(&thread.arena, hit.user_off, hit.user_len);
-    let id = slice(&thread.arena, hit.id_off, hit.id_len);
-    let (user_off, user_len) = push_text(&mut emit.text, user);
-    let (id_off, id_len) = push_text(&mut emit.text, id);
+    let (user_off, user_len) = if hit.user_len == 0 {
+        (0, 0)
+    } else {
+        let user = slice(&thread.arena, hit.user_off, hit.user_len);
+        push_text(&mut emit.text, user)
+    };
+    // Click-id ties are bytewise on the original id, not on the pack key.
+    let (id_off, id_len) = if hit.id_len == 0 {
+        let mut unpacked = [0u8; 9];
+        let n = crate::unpack_id(hit.id_hash, &mut unpacked);
+        debug_assert!(n > 0);
+        push_text(&mut emit.text, &unpacked[..n])
+    } else {
+        let id = slice(&thread.arena, hit.id_off, hit.id_len);
+        push_text(&mut emit.text, id)
+    };
     emit.clicks.push(Clk {
         user_hash: hit.user_hash,
         ts: hit.ts,

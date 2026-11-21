@@ -316,6 +316,60 @@ fn pack9(bytes: &[u8]) -> u64 {
         | b8
 }
 
+/// Inverse of `pack_id`. Returns 0 when `key` is 0 or not a packed id.
+fn unpack_id(key: u64, out: &mut [u8; 9]) -> usize {
+    if key == 0 {
+        return 0;
+    }
+    let bits = 63 - key.leading_zeros();
+    if bits == 0 || bits % 7 != 0 {
+        return 0;
+    }
+    let n = (bits / 7) as usize;
+    if n == 0 || n > 9 {
+        return 0;
+    }
+    let mut i = 0usize;
+    while i < n {
+        let shift = 7 * (n - 1 - i);
+        out[i] = ((key >> shift) & 0x7f) as u8;
+        i += 1;
+    }
+    n
+}
+
+/// Spread a packed id. The raw key's low bits are the last characters, so
+/// using it as a table index builds long probe chains.
+#[inline(always)]
+fn mix_key(key: u64) -> u64 {
+    let mut h = key.wrapping_mul(0x9E3779B185EBCA87);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xC2B2AE3D27D4EB4F);
+    h ^= h >> 29;
+    h
+}
+
+/// Shard and table index for an id. Packed ids mix the key; the key itself
+/// stays the equality check. Unpacked ids use `hash_bytes`.
+fn id_probe(bytes: &[u8]) -> u64 {
+    let key = pack_id(bytes);
+    if key != 0 {
+        mix_key(key)
+    } else {
+        hash_bytes(bytes)
+    }
+}
+
+/// `user_len == 0` stores the raw pack key in `user_hash`.
+#[inline(always)]
+fn user_probe(user_hash: u64, user_len: u32) -> u64 {
+    if user_len == 0 {
+        mix_key(user_hash)
+    } else {
+        user_hash
+    }
+}
+
 #[inline(always)]
 fn pack8(bytes: &[u8]) -> u64 {
     let w = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
@@ -408,10 +462,26 @@ impl UserShard {
         let old = std::mem::replace(&mut self.slots, vec![Slot { key: 0, id: EMPTY }; n]);
         for slot in old {
             if slot.id != EMPTY {
-                let hash = hash_bytes(self.name(slot.id));
+                let hash = if slot.key != 0 {
+                    mix_key(slot.key)
+                } else {
+                    hash_bytes(self.name(slot.id))
+                };
                 self.insert_slot(hash, slot.key, slot.id);
             }
         }
+    }
+
+    fn intern_packed(&mut self, key: u64) -> u32 {
+        let hash = mix_key(key);
+        if !self.slots.is_empty() {
+            if let Some(id) = self.lookup(hash, key, b"") {
+                return id;
+            }
+        }
+        let mut buf = [0u8; 9];
+        let n = unpack_id(key, &mut buf);
+        self.intern(hash, &buf[..n])
     }
 
     fn intern(&mut self, hash: u64, bytes: &[u8]) -> u32 {
@@ -1143,11 +1213,11 @@ fn intern_all(
     let n = nthreads.max(1);
     let mut ev_counts = vec![0usize; n];
     for row in &events {
-        ev_counts[bucket(row.user_hash, n)] += 1;
+        ev_counts[bucket(user_probe(row.user_hash, row.user_len), n)] += 1;
     }
     let mut cl_counts = vec![0usize; n];
     for row in &clicks {
-        cl_counts[bucket(row.user_hash, n)] += 1;
+        cl_counts[bucket(user_probe(row.user_hash, row.user_len), n)] += 1;
     }
     let mut ev_buckets = Vec::with_capacity(n);
     let mut cl_buckets = Vec::with_capacity(n);
@@ -1156,10 +1226,10 @@ fn intern_all(
         cl_buckets.push(Vec::with_capacity(cl_counts[i]));
     }
     for row in events {
-        ev_buckets[bucket(row.user_hash, n)].push(row);
+        ev_buckets[bucket(user_probe(row.user_hash, row.user_len), n)].push(row);
     }
     for row in clicks {
-        cl_buckets[bucket(row.user_hash, n)].push(row);
+        cl_buckets[bucket(user_probe(row.user_hash, row.user_len), n)].push(row);
     }
 
     let built = std::thread::scope(|scope| {
@@ -1195,8 +1265,8 @@ fn intern_all(
     let mut left = Vec::new();
     let mut right = Vec::new();
     for (a, b) in links {
-        let ha = hash_bytes(a);
-        let hb = hash_bytes(b);
+        let ha = id_probe(a);
+        let hb = id_probe(b);
         let ga = global_id(&shards, &prefix, ha, a);
         let gb = global_id(&shards, &prefix, hb, b);
         union_ids(&mut parent, &shards, &prefix, ga, gb, &mut left, &mut right);
@@ -1230,8 +1300,12 @@ fn intern_bucket(
     let mut map = UserShard::with_capacity(events.len() / 8 + clicks.len() / 8 + 1024);
     let mut slims = Vec::with_capacity(events.len());
     for row in events {
-        let bytes = &text[row.user_off as usize..row.user_off as usize + row.user_len as usize];
-        let local = map.intern(row.user_hash, bytes);
+        let local = if row.user_len == 0 {
+            map.intern_packed(row.user_hash)
+        } else {
+            let bytes = &text[row.user_off as usize..row.user_off as usize + row.user_len as usize];
+            map.intern(row.user_hash, bytes)
+        };
         slims.push(Slim {
             ts: row.ts,
             person: local,
@@ -1242,8 +1316,12 @@ fn intern_bucket(
     }
     let mut out_clicks = Vec::with_capacity(clicks.len());
     for row in clicks {
-        let bytes = &text[row.user_off as usize..row.user_off as usize + row.user_len as usize];
-        let local = map.intern(row.user_hash, bytes);
+        let local = if row.user_len == 0 {
+            map.intern_packed(row.user_hash)
+        } else {
+            let bytes = &text[row.user_off as usize..row.user_off as usize + row.user_len as usize];
+            map.intern(row.user_hash, bytes)
+        };
         out_clicks.push(Click {
             ts: row.ts,
             person: local,
@@ -1253,13 +1331,27 @@ fn intern_bucket(
         });
     }
     for (a, b) in links {
-        let ha = hash_bytes(a);
-        if bucket(ha, nthreads) == idx {
-            map.intern(ha, a);
+        let ka = pack_id(a);
+        if ka != 0 {
+            if bucket(mix_key(ka), nthreads) == idx {
+                map.intern_packed(ka);
+            }
+        } else {
+            let ha = hash_bytes(a);
+            if bucket(ha, nthreads) == idx {
+                map.intern(ha, a);
+            }
         }
-        let hb = hash_bytes(b);
-        if bucket(hb, nthreads) == idx {
-            map.intern(hb, b);
+        let kb = pack_id(b);
+        if kb != 0 {
+            if bucket(mix_key(kb), nthreads) == idx {
+                map.intern_packed(kb);
+            }
+        } else {
+            let hb = hash_bytes(b);
+            if bucket(hb, nthreads) == idx {
+                map.intern(hb, b);
+            }
         }
     }
     (map, slims, out_clicks)
@@ -2739,44 +2831,48 @@ fn self_check() {
         }
         assert_eq!(rest, 1);
         assert_eq!(&got[..n], sample);
+        let mut round = [0u8; 9];
+        let rn = unpack_id(key, &mut round);
+        assert_eq!(rn, n);
+        assert_eq!(&round[..n], sample);
     }
 
     let mut shard = UserShard::with_capacity(1);
     let mut stored: Vec<(Vec<u8>, u32)> = Vec::new();
     for i in 0..40u8 {
         let bytes = vec![b'u', i + 1];
-        let id = shard.intern(hash_bytes(&bytes), &bytes);
+        let id = shard.intern(id_probe(&bytes), &bytes);
         stored.push((bytes, id));
     }
     let long = b"0123456789abcdef".to_vec();
     let hi = vec![0xff, b'a', b'b'];
     let nine = b"abcdefghi".to_vec();
-    let id_long = shard.intern(hash_bytes(&long), &long);
-    let id_hi = shard.intern(hash_bytes(&hi), &hi);
-    let id_empty = shard.intern(hash_bytes(b""), b"");
-    let id_z1 = shard.intern(hash_bytes(b"\0"), b"\0");
-    let id_z2 = shard.intern(hash_bytes(b"\0\0"), b"\0\0");
-    let id_zero = shard.intern(hash_bytes(&[0]), &[0]);
-    let id_high = shard.intern(hash_bytes(&[0x80]), &[0x80]);
-    let id_nine = shard.intern(hash_bytes(&nine), &nine);
-    assert_eq!(shard.intern(hash_bytes(&nine), &nine), id_nine);
-    assert_eq!(shard.intern(hash_bytes(&long), &long), id_long);
-    assert_eq!(shard.intern(hash_bytes(&hi), &hi), id_hi);
+    let id_long = shard.intern(id_probe(&long), &long);
+    let id_hi = shard.intern(id_probe(&hi), &hi);
+    let id_empty = shard.intern(id_probe(b""), b"");
+    let id_z1 = shard.intern(id_probe(b"\0"), b"\0");
+    let id_z2 = shard.intern(id_probe(b"\0\0"), b"\0\0");
+    let id_zero = shard.intern(id_probe(&[0]), &[0]);
+    let id_high = shard.intern(id_probe(&[0x80]), &[0x80]);
+    let id_nine = shard.intern_packed(pack_id(&nine));
+    assert_eq!(shard.intern_packed(pack_id(&nine)), id_nine);
+    assert_eq!(shard.intern(id_probe(&long), &long), id_long);
+    assert_eq!(shard.intern(id_probe(&hi), &hi), id_hi);
     assert_ne!(id_z1, id_z2);
     assert_ne!(id_empty, id_z1);
     assert_ne!(id_zero, id_high);
     for (bytes, id) in &stored {
-        assert_eq!(shard.find(hash_bytes(bytes), bytes), Some(*id));
+        assert_eq!(shard.find(id_probe(bytes), bytes), Some(*id));
         assert_eq!(shard.name(*id), bytes.as_slice());
     }
     assert_eq!(shard.name(id_long), long.as_slice());
     assert_eq!(shard.name(id_hi), hi.as_slice());
     assert_eq!(shard.name(id_nine), nine.as_slice());
     assert_eq!(shard.name(id_empty), b"");
-    assert_eq!(shard.find(hash_bytes(&[0x80]), &[0x80]), Some(id_high));
-    assert_eq!(shard.find(hash_bytes(b"missing"), b"missing"), None);
-    let up = shard.intern(hash_bytes(b"uB"), b"uB");
-    let lo = shard.intern(hash_bytes(b"ua"), b"ua");
+    assert_eq!(shard.find(id_probe(&[0x80]), &[0x80]), Some(id_high));
+    assert_eq!(shard.find(id_probe(b"missing"), b"missing"), None);
+    let up = shard.intern(id_probe(b"uB"), b"uB");
+    let lo = shard.intern(id_probe(b"ua"), b"ua");
     assert_eq!(shard.name(up), b"uB");
     assert_eq!(shard.name(lo), b"ua");
     assert!(shard.name(up) < shard.name(lo));
