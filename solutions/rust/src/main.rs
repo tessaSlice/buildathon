@@ -249,7 +249,8 @@ impl Store {
 
 #[derive(Clone, Copy)]
 struct Slot {
-    hash: u64,
+    /// Packed id. 0 means the bytes did not pack; compare those with `name`.
+    key: u64,
     id: u32,
 }
 
@@ -260,11 +261,91 @@ struct UserShard {
     used: usize,
 }
 
+/// Pack 1..=9 bytes, each < 128, into a u64: 7 bits per byte and a marker at
+/// bit `7 * len` so the length lives in the high bits. 0 means "does not pack".
+#[inline(always)]
+fn pack_id(bytes: &[u8]) -> u64 {
+    let n = bytes.len();
+    if n == 9 {
+        return pack9(bytes);
+    }
+    if n == 8 {
+        return pack8(bytes);
+    }
+    if n == 0 || n > 9 {
+        return 0;
+    }
+    let mut hi = 0u8;
+    for &b in bytes {
+        hi |= b;
+    }
+    if hi >= 128 {
+        return 0;
+    }
+    let mut key = 1u64;
+    for &b in bytes {
+        key = (key << 7) | u64::from(b);
+    }
+    key
+}
+
+#[inline(always)]
+fn pack9(bytes: &[u8]) -> u64 {
+    let w = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    let b8 = u64::from(bytes[8]);
+    if (w & 0x8080_8080_8080_8080) != 0 || b8 >= 128 {
+        return 0;
+    }
+    let b0 = w & 0xff;
+    let b1 = (w >> 8) & 0xff;
+    let b2 = (w >> 16) & 0xff;
+    let b3 = (w >> 24) & 0xff;
+    let b4 = (w >> 32) & 0xff;
+    let b5 = (w >> 40) & 0xff;
+    let b6 = (w >> 48) & 0xff;
+    let b7 = (w >> 56) & 0xff;
+    (1u64 << 63)
+        | (b0 << 56)
+        | (b1 << 49)
+        | (b2 << 42)
+        | (b3 << 35)
+        | (b4 << 28)
+        | (b5 << 21)
+        | (b6 << 14)
+        | (b7 << 7)
+        | b8
+}
+
+#[inline(always)]
+fn pack8(bytes: &[u8]) -> u64 {
+    let w = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    if w & 0x8080_8080_8080_8080 != 0 {
+        return 0;
+    }
+    let b0 = w & 0xff;
+    let b1 = (w >> 8) & 0xff;
+    let b2 = (w >> 16) & 0xff;
+    let b3 = (w >> 24) & 0xff;
+    let b4 = (w >> 32) & 0xff;
+    let b5 = (w >> 40) & 0xff;
+    let b6 = (w >> 48) & 0xff;
+    let b7 = (w >> 56) & 0xff;
+    (1u64 << 56)
+        | (b0 << 49)
+        | (b1 << 42)
+        | (b2 << 35)
+        | (b3 << 28)
+        | (b4 << 21)
+        | (b5 << 14)
+        | (b6 << 7)
+        | b7
+}
+
 impl UserShard {
     fn with_capacity(n: usize) -> Self {
         let slots = (n.max(1) * 2).next_power_of_two().max(16);
         Self {
-            slots: vec![Slot { hash: 0, id: EMPTY }; slots],
+            slots: vec![Slot { key: 0, id: EMPTY }; slots],
             arena: Vec::new(),
             spans: Vec::new(),
             used: 0,
@@ -277,47 +358,66 @@ impl UserShard {
     }
 
     fn find(&self, hash: u64, bytes: &[u8]) -> Option<u32> {
-        if self.slots.is_empty() {
+        self.lookup(hash, pack_id(bytes), bytes)
+    }
+
+    #[inline(always)]
+    fn lookup(&self, hash: u64, key: u64, bytes: &[u8]) -> Option<u32> {
+        let n = self.slots.len();
+        if n == 0 {
             return None;
         }
-        let mask = self.slots.len() - 1;
+        let mask = n - 1;
         let mut i = (hash as usize) & mask;
-        let mut steps = 0usize;
-        while steps <= mask {
-            let slot = &self.slots[i];
+        if key != 0 {
+            for _ in 0..n {
+                let slot = self.slots[i];
+                if slot.id == EMPTY {
+                    return None;
+                }
+                if slot.key == key {
+                    return Some(slot.id);
+                }
+                i = (i + 1) & mask;
+            }
+            return None;
+        }
+        for _ in 0..n {
+            let slot = self.slots[i];
             if slot.id == EMPTY {
                 return None;
             }
-            if slot.hash == hash && self.name(slot.id) == bytes {
+            if slot.key == 0 && self.name(slot.id) == bytes {
                 return Some(slot.id);
             }
             i = (i + 1) & mask;
-            steps += 1;
         }
         None
     }
 
-    fn insert_slot(&mut self, hash: u64, id: u32) {
+    fn insert_slot(&mut self, hash: u64, key: u64, id: u32) {
         let mask = self.slots.len() - 1;
         let mut i = (hash as usize) & mask;
         while self.slots[i].id != EMPTY {
             i = (i + 1) & mask;
         }
-        self.slots[i] = Slot { hash, id };
+        self.slots[i] = Slot { key, id };
     }
 
     fn rehash(&mut self, n: usize) {
-        let old = std::mem::replace(&mut self.slots, vec![Slot { hash: 0, id: EMPTY }; n]);
+        let old = std::mem::replace(&mut self.slots, vec![Slot { key: 0, id: EMPTY }; n]);
         for slot in old {
             if slot.id != EMPTY {
-                self.insert_slot(slot.hash, slot.id);
+                let hash = hash_bytes(self.name(slot.id));
+                self.insert_slot(hash, slot.key, slot.id);
             }
         }
     }
 
     fn intern(&mut self, hash: u64, bytes: &[u8]) -> u32 {
+        let key = pack_id(bytes);
         if !self.slots.is_empty() {
-            if let Some(id) = self.find(hash, bytes) {
+            if let Some(id) = self.lookup(hash, key, bytes) {
                 return id;
             }
         }
@@ -330,7 +430,7 @@ impl UserShard {
         assert!(off <= u32::MAX as usize, "name arena exceeded 4 GiB");
         self.arena.extend_from_slice(bytes);
         self.spans.push((off as u32, bytes.len() as u32));
-        self.insert_slot(hash, id);
+        self.insert_slot(hash, key, id);
         self.used += 1;
         id
     }
@@ -2605,4 +2705,79 @@ fn self_check() {
     let line = b"e3\r,u1,2026-10-03T10:15:00Z,2026-10-03T12:00:00Z,view,p1,";
     assert!(split_unquoted(line, 7, &mut rel, &mut len));
     assert_eq!(field(line, rel[0], len[0]), b"e3\r");
+
+    assert_eq!(pack_id(b""), 0);
+    assert_eq!(pack_id(b"0123456789"), 0);
+    assert_eq!(pack_id(&[0x80]), 0);
+    assert_eq!(pack_id(&[0x7f, 0x80]), 0);
+    assert_ne!(pack_id(b"ab"), pack_id(b"ba"));
+    assert_ne!(pack_id(b"a"), pack_id(b"a\0"));
+    assert_ne!(pack_id(b"\0"), pack_id(b"\0\0"));
+    assert_ne!(pack_id(b"abcdefghi"), pack_id(b"abcdefgh"));
+    for sample in [
+        b"a".as_slice(),
+        b"\0",
+        b"\0\0",
+        b"u",
+        b"uB",
+        b"ua",
+        &[0x7f],
+        b"abcdefgh",
+        b"abcdefghi",
+        &[0x7f; 9],
+        &[0x00; 9],
+    ] {
+        let key = pack_id(sample);
+        assert_ne!(key, 0);
+        assert_eq!(63 - key.leading_zeros(), (7 * sample.len()) as u32);
+        let mut got = [0u8; 9];
+        let n = sample.len();
+        let mut rest = key;
+        for i in (0..n).rev() {
+            got[i] = (rest & 0x7f) as u8;
+            rest >>= 7;
+        }
+        assert_eq!(rest, 1);
+        assert_eq!(&got[..n], sample);
+    }
+
+    let mut shard = UserShard::with_capacity(1);
+    let mut stored: Vec<(Vec<u8>, u32)> = Vec::new();
+    for i in 0..40u8 {
+        let bytes = vec![b'u', i + 1];
+        let id = shard.intern(hash_bytes(&bytes), &bytes);
+        stored.push((bytes, id));
+    }
+    let long = b"0123456789abcdef".to_vec();
+    let hi = vec![0xff, b'a', b'b'];
+    let nine = b"abcdefghi".to_vec();
+    let id_long = shard.intern(hash_bytes(&long), &long);
+    let id_hi = shard.intern(hash_bytes(&hi), &hi);
+    let id_empty = shard.intern(hash_bytes(b""), b"");
+    let id_z1 = shard.intern(hash_bytes(b"\0"), b"\0");
+    let id_z2 = shard.intern(hash_bytes(b"\0\0"), b"\0\0");
+    let id_zero = shard.intern(hash_bytes(&[0]), &[0]);
+    let id_high = shard.intern(hash_bytes(&[0x80]), &[0x80]);
+    let id_nine = shard.intern(hash_bytes(&nine), &nine);
+    assert_eq!(shard.intern(hash_bytes(&nine), &nine), id_nine);
+    assert_eq!(shard.intern(hash_bytes(&long), &long), id_long);
+    assert_eq!(shard.intern(hash_bytes(&hi), &hi), id_hi);
+    assert_ne!(id_z1, id_z2);
+    assert_ne!(id_empty, id_z1);
+    assert_ne!(id_zero, id_high);
+    for (bytes, id) in &stored {
+        assert_eq!(shard.find(hash_bytes(bytes), bytes), Some(*id));
+        assert_eq!(shard.name(*id), bytes.as_slice());
+    }
+    assert_eq!(shard.name(id_long), long.as_slice());
+    assert_eq!(shard.name(id_hi), hi.as_slice());
+    assert_eq!(shard.name(id_nine), nine.as_slice());
+    assert_eq!(shard.name(id_empty), b"");
+    assert_eq!(shard.find(hash_bytes(&[0x80]), &[0x80]), Some(id_high));
+    assert_eq!(shard.find(hash_bytes(b"missing"), b"missing"), None);
+    let up = shard.intern(hash_bytes(b"uB"), b"uB");
+    let lo = shard.intern(hash_bytes(b"ua"), b"ua");
+    assert_eq!(shard.name(up), b"uB");
+    assert_eq!(shard.name(lo), b"ua");
+    assert!(shard.name(up) < shard.name(lo));
 }

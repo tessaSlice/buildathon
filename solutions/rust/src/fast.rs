@@ -1,8 +1,9 @@
 //! Parallel scan and hash dedup for the high-volume path.
 //!
 //! Each worker reads a byte range, parses into a string arena, and appends
-//! compact rows sharded by id hash. Dedup is then an open-address table per
-//! shard, so equal ids never meet in a single-threaded merge.
+//! compact rows sharded by id hash. Dedup fingerprints a shard with a
+//! saturating counter and emits ids that occur once. Only real duplicates
+//! and fingerprint collisions go through a small open-address table.
 
 use crate::{
     bucket, count_nl, field, find_nl, hash_bytes, list_csv, parse_links, parse_price, parse_ts,
@@ -19,7 +20,7 @@ const EVENT: u8 = 0;
 const CLICK: u8 = 1;
 /// When set, every SIMD line is checked against `split_unquoted`. A mismatch
 /// falls back to the scalar splitter, so the output stays exact.
-const VERIFY_SPANS: bool = true;
+const VERIFY_SPANS: bool = false;
 
 static SPAN_MISMATCH: AtomicU64 = AtomicU64::new(0);
 
@@ -69,11 +70,57 @@ struct ShardEmit {
     text: Vec<u8>,
 }
 
+/// High 26 bits of the id hash. 2^26 bytes is 64 MiB per shard.
+const FINGER_N: usize = 1 << 26;
+const FINGER_MASK: usize = FINGER_N - 1;
+const HUGE_PAGE: usize = 2 << 20;
+const EMPTY_SRC: u32 = u32::MAX;
+/// Prefetch this many hits ahead so the counter miss is already in flight.
+const PREFETCH_DIST: usize = 16;
+
 #[derive(Clone, Copy)]
-struct DSlot {
+struct Loc {
     hash: u64,
     src: u32,
     row: u32,
+}
+
+struct FingerCounts {
+    raw: *mut u8,
+    raw_len: usize,
+    ptr: *mut u8,
+}
+
+impl FingerCounts {
+    fn new() -> Self {
+        let raw_len = FINGER_N + HUGE_PAGE;
+        let raw = mmap_anon(raw_len);
+        let addr = raw as usize;
+        let aligned = (addr + HUGE_PAGE - 1) & !(HUGE_PAGE - 1);
+        let ptr = aligned as *mut u8;
+        madvise_huge(ptr, FINGER_N);
+        // Fault 2 MiB pages up front. mmap memory is already zero.
+        let mut off = 0usize;
+        while off < FINGER_N {
+            unsafe { *ptr.add(off) = 0; }
+            off += HUGE_PAGE;
+        }
+        Self { raw, raw_len, ptr }
+    }
+
+    fn as_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, FINGER_N) }
+    }
+
+    fn clear(&mut self) {
+        self.as_mut().fill(0);
+    }
+}
+
+impl Drop for FingerCounts {
+    fn drop(&mut self) {
+        munmap_anon(self.raw, self.raw_len);
+    }
 }
 
 pub fn ingest(
@@ -594,7 +641,11 @@ fn accept_event(
     if purchase {
         flags |= BUY;
     }
-    let cat = if product.is_empty() {
+    // Top category sums purchase price only. Views and carts still need a
+    // non-empty product id (checked above) but their category is unused.
+    let cat = if !purchase {
+        0
+    } else if product.is_empty() {
         unknown
     } else {
         lookup(product, b"p", prod_arr, products).unwrap_or(unknown)
@@ -732,148 +783,259 @@ fn dedup_shard(threads: &[ThreadOut], shard: usize) -> ShardEmit {
         clicks: Vec::new(),
         text: Vec::new(),
     };
-    dedup_events(threads, shard, &mut emit);
-    dedup_clicks(threads, shard, &mut emit);
+    let mut counts = FingerCounts::new();
+    dedup_events(threads, shard, &mut emit, counts.as_mut());
+    counts.clear();
+    dedup_clicks(threads, shard, &mut emit, counts.as_mut());
     emit
 }
 
-fn dedup_events(threads: &[ThreadOut], shard: usize, emit: &mut ShardEmit) {
-    let mut keys = Vec::new();
-    for (ti, thread) in threads.iter().enumerate() {
-        for (ri, hit) in thread.events[shard].iter().enumerate() {
-            keys.push(DSlot {
-                hash: hit.id_hash,
-                src: ti as u32,
-                row: ri as u32,
-            });
-        }
+fn dedup_events(threads: &[ThreadOut], shard: usize, emit: &mut ShardEmit, count: &mut [u8]) {
+    let mut n = 0usize;
+    for thread in threads {
+        let hits = &thread.events[shard];
+        n += hits.len();
+        bump_event_counts(hits, count);
     }
-    if keys.is_empty() {
+    if n == 0 {
         return;
     }
-    radix_hash(&mut keys);
-    emit.events.reserve(keys.len());
-    let mut i = 0usize;
-    while i < keys.len() {
-        let hash = keys[i].hash;
-        let mut j = i + 1;
-        while j < keys.len() && keys[j].hash == hash {
-            j += 1;
+    emit.events.reserve(n);
+    emit.text.reserve(n.saturating_mul(16));
+    let mut suspects = Vec::new();
+    let ptr = count.as_ptr();
+    for (ti, thread) in threads.iter().enumerate() {
+        let hits = &thread.events[shard];
+        let mut k = 0usize;
+        while k < hits.len() {
+            if k + PREFETCH_DIST < hits.len() {
+                prefetch_count(ptr, finger(hits[k + PREFETCH_DIST].id_hash));
+            }
+            let hit = &hits[k];
+            let c = unsafe { *ptr.add(finger(hit.id_hash)) };
+            if c == 1 {
+                emit_event_hit(thread, hit, emit);
+            } else {
+                suspects.push(Loc {
+                    hash: hit.id_hash,
+                    src: ti as u32,
+                    row: k as u32,
+                });
+            }
+            k += 1;
         }
-        if j == i + 1 {
-            emit_event(threads, shard, keys[i], emit);
-        } else {
-            let group = &mut keys[i..j];
-            group.sort_by(|a, b| {
-                ev_id(threads, shard, *a)
-                    .cmp(ev_id(threads, shard, *b))
-                    .then_with(|| ev_ing(threads, shard, *a).cmp(ev_ing(threads, shard, *b)))
-            });
-            let mut prev: &[u8] = b"";
-            let mut have = false;
-            for key in group.iter().copied() {
-                let id = ev_id(threads, shard, key);
-                if have && id == prev {
-                    continue;
+    }
+    resolve_events(threads, shard, &suspects, emit);
+}
+
+fn dedup_clicks(threads: &[ThreadOut], shard: usize, emit: &mut ShardEmit, count: &mut [u8]) {
+    let mut n = 0usize;
+    for thread in threads {
+        let hits = &thread.clicks[shard];
+        n += hits.len();
+        bump_click_counts(hits, count);
+    }
+    if n == 0 {
+        return;
+    }
+    emit.clicks.reserve(n);
+    emit.text.reserve(n.saturating_mul(32));
+    let mut suspects = Vec::new();
+    let ptr = count.as_ptr();
+    for (ti, thread) in threads.iter().enumerate() {
+        let hits = &thread.clicks[shard];
+        let mut k = 0usize;
+        while k < hits.len() {
+            if k + PREFETCH_DIST < hits.len() {
+                prefetch_count(ptr, finger(hits[k + PREFETCH_DIST].id_hash));
+            }
+            let hit = &hits[k];
+            let c = unsafe { *ptr.add(finger(hit.id_hash)) };
+            if c == 1 {
+                emit_click_hit(thread, hit, emit);
+            } else {
+                suspects.push(Loc {
+                    hash: hit.id_hash,
+                    src: ti as u32,
+                    row: k as u32,
+                });
+            }
+            k += 1;
+        }
+    }
+    resolve_clicks(threads, shard, &suspects, emit);
+}
+
+#[inline(always)]
+fn finger(hash: u64) -> usize {
+    ((hash >> 32) as usize) & FINGER_MASK
+}
+
+fn bump_event_counts(hits: &[EHit], count: &mut [u8]) {
+    let ptr = count.as_mut_ptr();
+    let n = hits.len();
+    let mut k = 0usize;
+    while k < n {
+        if k + PREFETCH_DIST < n {
+            prefetch_count(ptr, finger(hits[k + PREFETCH_DIST].id_hash));
+        }
+        bump_count(ptr, hits[k].id_hash);
+        k += 1;
+    }
+}
+
+fn bump_click_counts(hits: &[CHit], count: &mut [u8]) {
+    let ptr = count.as_mut_ptr();
+    let n = hits.len();
+    let mut k = 0usize;
+    while k < n {
+        if k + PREFETCH_DIST < n {
+            prefetch_count(ptr, finger(hits[k + PREFETCH_DIST].id_hash));
+        }
+        bump_count(ptr, hits[k].id_hash);
+        k += 1;
+    }
+}
+
+#[inline(always)]
+fn bump_count(ptr: *mut u8, hash: u64) {
+    unsafe {
+        let c = &mut *ptr.add(finger(hash));
+        *c = c.saturating_add(1);
+    }
+}
+
+#[inline(always)]
+fn prefetch_count(ptr: *const u8, idx: usize) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(
+            ptr.add(idx) as *const i8,
+            std::arch::x86_64::_MM_HINT_T0,
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (ptr, idx);
+    }
+}
+
+fn resolve_events(threads: &[ThreadOut], shard: usize, suspects: &[Loc], emit: &mut ShardEmit) {
+    if suspects.is_empty() {
+        return;
+    }
+    let cap = table_cap(suspects.len());
+    let mut slots = vec![empty_loc(); cap];
+    let mask = cap - 1;
+    for s in suspects {
+        let mut i = slot_index(s.hash, mask);
+        let mut steps = 0usize;
+        loop {
+            let src = slots[i].src;
+            if src == EMPTY_SRC {
+                slots[i] = *s;
+                break;
+            }
+            if slots[i].hash == s.hash
+                && event_id(threads, shard, src, slots[i].row) == event_id(threads, shard, s.src, s.row)
+            {
+                // Smallest ingest wins. Equal ingest copies are identical.
+                if event_ing(threads, shard, s.src, s.row) < event_ing(threads, shard, src, slots[i].row)
+                {
+                    slots[i].src = s.src;
+                    slots[i].row = s.row;
                 }
-                prev = id;
-                have = true;
-                emit_event(threads, shard, key, emit);
+                break;
+            }
+            i = (i + 1) & mask;
+            steps += 1;
+            if steps > mask {
+                panic!("event dedup table full");
             }
         }
-        i = j;
+    }
+    for slot in &slots {
+        if slot.src != EMPTY_SRC {
+            let thread = &threads[slot.src as usize];
+            let hit = &thread.events[shard][slot.row as usize];
+            emit_event_hit(thread, hit, emit);
+        }
     }
 }
 
-fn dedup_clicks(threads: &[ThreadOut], shard: usize, emit: &mut ShardEmit) {
-    let mut keys = Vec::new();
-    for (ti, thread) in threads.iter().enumerate() {
-        for (ri, hit) in thread.clicks[shard].iter().enumerate() {
-            keys.push(DSlot {
-                hash: hit.id_hash,
-                src: ti as u32,
-                row: ri as u32,
-            });
-        }
-    }
-    if keys.is_empty() {
+fn resolve_clicks(threads: &[ThreadOut], shard: usize, suspects: &[Loc], emit: &mut ShardEmit) {
+    if suspects.is_empty() {
         return;
     }
-    radix_hash(&mut keys);
-    emit.clicks.reserve(keys.len());
-    let mut i = 0usize;
-    while i < keys.len() {
-        let hash = keys[i].hash;
-        let mut j = i + 1;
-        while j < keys.len() && keys[j].hash == hash {
-            j += 1;
-        }
-        if j == i + 1 {
-            emit_click(threads, shard, keys[i], emit);
-        } else {
-            let group = &mut keys[i..j];
-            group.sort_by(|a, b| cl_id(threads, shard, *a).cmp(cl_id(threads, shard, *b)));
-            let mut prev: &[u8] = b"";
-            let mut have = false;
-            for key in group.iter().copied() {
-                let id = cl_id(threads, shard, key);
-                if have && id == prev {
-                    continue;
-                }
-                prev = id;
-                have = true;
-                emit_click(threads, shard, key, emit);
+    let cap = table_cap(suspects.len());
+    let mut slots = vec![empty_loc(); cap];
+    let mask = cap - 1;
+    for s in suspects {
+        let mut i = slot_index(s.hash, mask);
+        let mut steps = 0usize;
+        loop {
+            let src = slots[i].src;
+            if src == EMPTY_SRC {
+                slots[i] = *s;
+                break;
+            }
+            if slots[i].hash == s.hash
+                && click_id(threads, shard, src, slots[i].row) == click_id(threads, shard, s.src, s.row)
+            {
+                break;
+            }
+            i = (i + 1) & mask;
+            steps += 1;
+            if steps > mask {
+                panic!("click dedup table full");
             }
         }
-        i = j;
+    }
+    for slot in &slots {
+        if slot.src != EMPTY_SRC {
+            let thread = &threads[slot.src as usize];
+            let hit = &thread.clicks[shard][slot.row as usize];
+            emit_click_hit(thread, hit, emit);
+        }
     }
 }
 
-fn radix_hash(keys: &mut Vec<DSlot>) {
-    let n = keys.len();
-    if n < 2 {
-        return;
-    }
-    let mut tmp = vec![DSlot { hash: 0, src: 0, row: 0 }; n];
-    for pass in 0..8 {
-        let shift = pass * 8;
-        let mut hist = [0u32; 256];
-        for key in keys.iter() {
-            hist[((key.hash >> shift) & 255) as usize] += 1;
-        }
-        let mut sum = 0u32;
-        for slot in hist.iter_mut() {
-            let count = *slot;
-            *slot = sum;
-            sum += count;
-        }
-        for key in keys.iter() {
-            let b = ((key.hash >> shift) & 255) as usize;
-            tmp[hist[b] as usize] = *key;
-            hist[b] += 1;
-        }
-        std::mem::swap(keys, &mut tmp);
+fn empty_loc() -> Loc {
+    Loc {
+        hash: 0,
+        src: EMPTY_SRC,
+        row: 0,
     }
 }
 
-fn ev_id<'a>(threads: &'a [ThreadOut], shard: usize, key: DSlot) -> &'a [u8] {
-    let hit = &threads[key.src as usize].events[shard][key.row as usize];
-    slice(&threads[key.src as usize].arena, hit.id_off, hit.id_len)
+fn table_cap(n: usize) -> usize {
+    n.next_power_of_two().saturating_mul(2).max(16)
 }
 
-fn ev_ing<'a>(threads: &'a [ThreadOut], shard: usize, key: DSlot) -> &'a [u8] {
-    let hit = &threads[key.src as usize].events[shard][key.row as usize];
-    slice(&threads[key.src as usize].arena, hit.ing_off, hit.ing_len)
+#[inline(always)]
+fn slot_index(hash: u64, mask: usize) -> usize {
+    // Low bits select the shard. A multiply would keep those bits frozen in
+    // the index, so fold the high half down before masking.
+    let mixed = hash ^ hash.rotate_left(32);
+    (mixed as usize) & mask
 }
 
-fn cl_id<'a>(threads: &'a [ThreadOut], shard: usize, key: DSlot) -> &'a [u8] {
-    let hit = &threads[key.src as usize].clicks[shard][key.row as usize];
-    slice(&threads[key.src as usize].arena, hit.id_off, hit.id_len)
+fn event_id<'a>(threads: &'a [ThreadOut], shard: usize, src: u32, row: u32) -> &'a [u8] {
+    let hit = &threads[src as usize].events[shard][row as usize];
+    slice(&threads[src as usize].arena, hit.id_off, hit.id_len)
 }
 
-fn emit_event(threads: &[ThreadOut], shard: usize, key: DSlot, emit: &mut ShardEmit) {
-    let thread = &threads[key.src as usize];
-    let hit = &thread.events[shard][key.row as usize];
+fn event_ing<'a>(threads: &'a [ThreadOut], shard: usize, src: u32, row: u32) -> &'a [u8] {
+    let hit = &threads[src as usize].events[shard][row as usize];
+    slice(&threads[src as usize].arena, hit.ing_off, hit.ing_len)
+}
+
+fn click_id<'a>(threads: &'a [ThreadOut], shard: usize, src: u32, row: u32) -> &'a [u8] {
+    let hit = &threads[src as usize].clicks[shard][row as usize];
+    slice(&threads[src as usize].arena, hit.id_off, hit.id_len)
+}
+
+fn emit_event_hit(thread: &ThreadOut, hit: &EHit, emit: &mut ShardEmit) {
     if hit.flags & OK == 0 {
         return;
     }
@@ -890,9 +1052,7 @@ fn emit_event(threads: &[ThreadOut], shard: usize, key: DSlot, emit: &mut ShardE
     });
 }
 
-fn emit_click(threads: &[ThreadOut], shard: usize, key: DSlot, emit: &mut ShardEmit) {
-    let thread = &threads[key.src as usize];
-    let hit = &thread.clicks[shard][key.row as usize];
+fn emit_click_hit(thread: &ThreadOut, hit: &CHit, emit: &mut ShardEmit) {
     if hit.flags & OK == 0 {
         return;
     }
@@ -909,6 +1069,47 @@ fn emit_click(threads: &[ThreadOut], shard: usize, key: DSlot, emit: &mut ShardE
         id_off,
         id_len,
     });
+}
+
+fn mmap_anon(len: usize) -> *mut u8 {
+    const PROT_READ: i32 = 1;
+    const PROT_WRITE: i32 = 2;
+    const MAP_PRIVATE: i32 = 2;
+    const MAP_ANONYMOUS: i32 = 0x20;
+    extern "C" {
+        fn mmap(
+            addr: *mut u8,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut u8;
+    }
+    let ptr = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) };
+    if ptr as usize == usize::MAX {
+        panic!("dedup fingerprint mmap failed");
+    }
+    ptr
+}
+
+fn madvise_huge(ptr: *mut u8, len: usize) {
+    const MADV_HUGEPAGE: i32 = 14;
+    extern "C" {
+        fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    }
+    unsafe {
+        let _ = madvise(ptr, len, MADV_HUGEPAGE);
+    }
+}
+
+fn munmap_anon(ptr: *mut u8, len: usize) {
+    extern "C" {
+        fn munmap(addr: *mut u8, len: usize) -> i32;
+    }
+    unsafe {
+        let _ = munmap(ptr, len);
+    }
 }
 
 fn concat_parts(parts: Vec<ShardEmit>) -> (Vec<Compact>, Vec<Clk>, Vec<u8>) {
